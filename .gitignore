@@ -1,0 +1,21 @@
+# Saved browser profile and authenticated session data
+browser_data/
+
+# Local virtual environment
+SDBvenv/
+.venv/
+venv/
+
+# Python caches and generated files
+__pycache__/
+*.py[cod]
+
+# Local configuration and secrets
+.env
+.env.*
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
