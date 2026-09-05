@@ -1,6 +1,10 @@
 # Saved browser profile and authenticated session data
 browser_data/
 
+# Downloaded activities and the generated local database
+incoming/*.tcx
+strava_dashboard.db
+
 # Local virtual environment
 SDBvenv/
 .venv/
