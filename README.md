@@ -18,8 +18,11 @@ python scripts\final_launcher.py
 See the [complete Version 1 instructions](version_1/README.md) for login,
 troubleshooting, retry behavior, and privacy guidance.
 
-The locally developed `version_2` and `app_version` editions are intentionally
-not published by this repository update.
+Version 2 is maintained in a separate repository. See its
+[installation and usage guide](https://github.com/leezongzhe/stravadashboard_version2/blob/main/README.md).
+
+The locally developed `app_version` edition is intentionally not published by
+this repository update.
 
 ## Private data
 
