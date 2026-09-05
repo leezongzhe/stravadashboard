@@ -1,3 +1,4 @@
+import argparse
 import subprocess
 import sys
 import time
@@ -36,7 +37,7 @@ DASHBOARD_SCRIPT = (
 # MAIN PIPELINE
 # ============================================================
 
-def main():
+def main(retry_unavailable=False):
 
     print("=" * 60)
     print("STRAVA DASHBOARD MASTER PIPELINE")
@@ -88,11 +89,16 @@ def main():
 
     try:
 
+        discovery_command = [
+            sys.executable,
+            str(DISCOVERY_SCRIPT)
+        ]
+
+        if retry_unavailable:
+            discovery_command.append("--retry-unavailable")
+
         subprocess.run(
-            [
-                sys.executable,
-                str(DISCOVERY_SCRIPT)
-            ],
+            discovery_command,
             cwd=str(BASE_DIR),
             check=True
         )
@@ -209,6 +215,8 @@ def main():
 
     subprocess.run(
         [
+            sys.executable,
+            "-m",
             "streamlit",
             "run",
             "dashboard.py"
@@ -223,9 +231,17 @@ def main():
 
 if __name__ == "__main__":
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--retry-unavailable",
+        action="store_true",
+        help="Retry activities previously recorded without TCX data."
+    )
+    args = parser.parse_args()
+
     try:
 
-        main()
+        main(args.retry_unavailable)
 
     except KeyboardInterrupt:
 

@@ -1,4 +1,5 @@
 import asyncio
+import argparse
 import re
 import sqlite3
 import sys
@@ -20,15 +21,83 @@ DB_PATH = BASE_DIR / "strava_dashboard.db"
 BROWSER_DATA_DIR.mkdir(exist_ok=True)
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-CHROME_PATH = (
-    r"C:\Program Files (x86)\Google"
-    r"\Chrome\Application\chrome.exe"
-)
-
-
 # ============================================================
 # Database
 # ============================================================
+
+def init_activity_status_table():
+    """Create a registry for activities that do not have TCX data."""
+    conn = sqlite3.connect(DB_PATH)
+
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS activity_import_status (
+                activity_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                last_error TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_unavailable_activity_ids() -> set:
+    """Return activities previously found to have no downloadable TCX."""
+    init_activity_status_table()
+    conn = sqlite3.connect(DB_PATH)
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT activity_id
+            FROM activity_import_status
+            WHERE status = 'tcx_unavailable'
+            """
+        ).fetchall()
+        return {str(row[0]) for row in rows}
+    finally:
+        conn.close()
+
+
+def mark_tcx_unavailable(activity_id, error):
+    """Remember a manual/non-exportable activity without fake trackpoints."""
+    init_activity_status_table()
+    conn = sqlite3.connect(DB_PATH)
+
+    try:
+        conn.execute(
+            """
+            INSERT INTO activity_import_status (
+                activity_id, status, last_error, updated_at
+            ) VALUES (?, 'tcx_unavailable', ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(activity_id) DO UPDATE SET
+                status = excluded.status,
+                last_error = excluded.last_error,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (str(activity_id), str(error)[:1000])
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_unavailable_activities():
+    """Allow explicitly requested retries of previously unavailable TCX files."""
+    init_activity_status_table()
+    conn = sqlite3.connect(DB_PATH)
+
+    try:
+        conn.execute(
+            "DELETE FROM activity_import_status WHERE status = 'tcx_unavailable'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 def get_existing_activity_ids() -> set:
     """
@@ -96,41 +165,90 @@ def get_downloaded_activity_ids() -> set:
     return downloaded_ids
 
 
-# ============================================================
-# Google Login
-# ============================================================
+async def ensure_logged_in(page):
+    """Pause in the visible browser for first-time/manual Strava login."""
+    training_url = "https://www.strava.com/athlete/training"
 
-async def google_login(page):
+    def is_authenticated_strava_url(url):
+        return bool(re.match(
+            r"https://(www\.)?strava\.com/(?!login|register)",
+            url
+        ))
 
-    print(
-        "\n[*] Checking Google login button..."
+    await page.goto(training_url, wait_until="domcontentloaded")
+    await asyncio.sleep(2)
+
+    if is_authenticated_strava_url(page.url):
+        print("[✓] Existing Strava login session found.")
+        return
+
+    # Strava may expire its own session while the persistent Google session
+    # remains valid. In that case, clicking the Google button is sufficient
+    # and should not require the user to intervene on every launch.
+    google_button_name = re.compile(
+        r"(continue|sign up|log in|sign in).*google|google.*(continue|sign up|log in|sign in)",
+        re.IGNORECASE
     )
 
+    google_controls = [
+        page.get_by_role("button", name=google_button_name),
+        page.get_by_role("link", name=google_button_name),
+    ]
+
+    for control in google_controls:
+        if await control.count() > 0 and await control.first.is_visible():
+            print("[*] Reusing the saved Google login session...")
+            await control.first.click()
+            await asyncio.sleep(3)
+            break
+
+    if is_authenticated_strava_url(page.url):
+        print("[✓] Google login completed automatically.")
+        await page.goto(training_url, wait_until="domcontentloaded")
+        return
+
+    print("\n" + "=" * 60)
+    print("STRAVA LOGIN REQUIRED")
+    print("Complete login in the open Chrome window.")
+    print("The launcher will continue automatically after login.")
+    print("=" * 60)
+
     try:
-
-        google_btn = page.get_by_role(
-            "button",
-            name="Sign Up With Google"
+        await page.wait_for_url(
+            re.compile(r"https://www\.strava\.com/(?!login|register).+"),
+            timeout=300000,
+            wait_until="domcontentloaded"
         )
+    except Exception as exc:
+        raise RuntimeError(
+            "Strava login was not completed within 5 minutes."
+        ) from exc
 
-        await google_btn.wait_for(
-            state="visible",
-            timeout=5000
+    await page.goto(training_url, wait_until="domcontentloaded")
+    await asyncio.sleep(2)
+
+    if not is_authenticated_strava_url(page.url):
+        raise RuntimeError("Strava login could not be verified.")
+
+    print("[✓] Login completed and saved for future launches.")
+
+
+async def launch_browser(playwright):
+    """Launch installed Chrome, with Playwright Chromium as a fallback."""
+    options = {
+        "user_data_dir": str(BROWSER_DATA_DIR),
+        "headless": False,
+    }
+
+    try:
+        return await playwright.chromium.launch_persistent_context(
+            channel="chrome",
+            **options
         )
-
-        await google_btn.click()
-
-        print(
-            "[✓] Successfully clicked "
-            "'Sign Up With Google' button!"
-        )
-
-    except Exception:
-
-        print(
-            "\nSkipped Google auto-click "
-            "(You might already be logged in)."
-        )
+    except Exception as chrome_error:
+        print(f"[!] Google Chrome could not be launched: {chrome_error}")
+        print("[*] Trying Playwright Chromium instead...")
+        return await playwright.chromium.launch_persistent_context(**options)
 
 
 # ============================================================
@@ -233,7 +351,7 @@ async def download_tcx(page, activity_id):
     except Exception as e:
         print(f"[X] Failed to download {activity_id}")
         print(f"    Error: {e}")
-        return False
+        return False, e
         
     finally:
         # 4. Ensure the temporary tab is closed so you don't leak memory
@@ -244,7 +362,7 @@ async def download_tcx(page, activity_id):
 # Main
 # ============================================================
 
-async def main():
+async def main(retry_unavailable=False):
 
     # --------------------------------------------------------
     # Step 1 — Check existing activities
@@ -258,6 +376,12 @@ async def main():
         get_downloaded_activity_ids()
     )
 
+    if retry_unavailable:
+        clear_unavailable_activities()
+        print("[*] Previously unavailable activities will be retried.")
+
+    unavailable_ids = get_unavailable_activity_ids()
+
     print(
         f"[*] Activities already in SQLite: "
         f"{len(existing_ids)}"
@@ -266,6 +390,11 @@ async def main():
     print(
         f"[*] TCX files already in incoming/: "
         f"{len(downloaded_ids)}"
+    )
+
+    print(
+        f"[*] Activities recorded without TCX: "
+        f"{len(unavailable_ids)}"
     )
 
 
@@ -279,16 +408,7 @@ async def main():
             "\n[*] Launching Google Chrome..."
         )
 
-        context = (
-            await p.chromium
-            .launch_persistent_context(
-                user_data_dir=str(
-                    BROWSER_DATA_DIR
-                ),
-                executable_path=CHROME_PATH,
-                headless=False
-            )
-        )
+        context = await launch_browser(p)
 
         if context.pages:
 
@@ -300,30 +420,14 @@ async def main():
 
 
         # ----------------------------------------------------
-        # Step 3 — Open Strava
+        # Step 3 — Open Strava and complete first-time login
         # ----------------------------------------------------
 
         print(
             "\n[*] Opening Strava..."
         )
 
-        await page.goto(
-            "https://strava.com",
-            wait_until="domcontentloaded"
-        )
-
-        await asyncio.sleep(2)
-
-
-        # ----------------------------------------------------
-        # Step 4 — Google Login
-        # ----------------------------------------------------
-
-        await google_login(page)
-
-
-        # Give login/navigation time
-        await asyncio.sleep(3)
+        await ensure_logged_in(page)
 
 
         # ----------------------------------------------------
@@ -343,13 +447,14 @@ async def main():
 
         # Activity is considered already handled if:
         #
-        # 1. It exists in SQLite
-        # OR
+        # 1. It has trackpoints in SQLite
         # 2. Its TCX already exists in incoming/
+        # 3. It was recorded as having no downloadable TCX
 
         handled_ids = (
             existing_ids |
-            downloaded_ids
+            downloaded_ids |
+            unavailable_ids
         )
 
         new_activities = sorted(
@@ -424,10 +529,15 @@ async def main():
                     f"{len(new_activities)}]"
                 )
 
-                success = await download_tcx(
+                result = await download_tcx(
                     page,
                     activity_id
                 )
+
+                if isinstance(result, tuple):
+                    success, error = result
+                else:
+                    success, error = result, None
 
 
                 if success:
@@ -439,7 +549,14 @@ async def main():
                 else:
 
                     print(
-                        "[X] Download failed."
+                        "[!] TCX is unavailable. The activity "
+                        "has been recorded in SQLite and will "
+                        "not be retried automatically."
+                    )
+
+                    mark_tcx_unavailable(
+                        activity_id,
+                        error or "TCX download did not start"
                     )
 
 
@@ -468,6 +585,14 @@ async def main():
 
 if __name__ == "__main__":
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--retry-unavailable",
+        action="store_true",
+        help="Retry activities previously recorded without TCX data."
+    )
+    args = parser.parse_args()
+
     try:
 
         loop = asyncio.get_running_loop()
@@ -475,7 +600,7 @@ if __name__ == "__main__":
         if loop.is_running():
 
             loop.create_task(
-                main()
+                main(args.retry_unavailable)
             )
 
     except RuntimeError:
@@ -483,7 +608,7 @@ if __name__ == "__main__":
         try:
 
             asyncio.run(
-                main()
+                main(args.retry_unavailable)
             )
 
         except KeyboardInterrupt:

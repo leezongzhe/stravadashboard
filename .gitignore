@@ -2,7 +2,7 @@
 browser_data/
 
 # Downloaded activities and the generated local database
-incoming/*.tcx
+**/incoming/*.tcx
 strava_dashboard.db
 
 # Local virtual environment
